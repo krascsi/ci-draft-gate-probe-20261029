@@ -1,0 +1,109 @@
+name: Validate m1
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    branches: [base-m1]
+permissions:
+  contents: read
+  pull-requests: read
+jobs:
+  actionlint:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "toy actionlint passed"
+  scope:
+    runs-on: ubuntu-latest
+    outputs:
+      draft: ${{ steps.scope.outputs.draft }}
+      run_code_checks: ${{ steps.scope.outputs.run_code_checks }}
+      run_runtime_checks: ${{ steps.scope.outputs.run_runtime_checks }}
+    steps:
+      - id: scope
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_DRAFT: ${{ github.event.pull_request.draft }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          files=$(gh api "repos/$REPOSITORY/pulls/$PR_NUMBER/files" --jq '.[].filename')
+          printf '%s\n' "$files"
+          code=false
+          runtime=false
+          if grep -q '^app/' <<< "$files"; then code=true; fi
+          if grep -q '^runtime/' <<< "$files"; then runtime=true; fi
+          draft=false
+          if [ "$EVENT_NAME" = "pull_request" ] && [ "${PR_DRAFT:-}" = "true" ]; then
+            draft=true
+            code=false
+            runtime=false
+          fi
+          echo "draft=$draft run_code_checks=$code run_runtime_checks=$runtime"
+          { echo "draft=$draft"; echo "run_code_checks=$code"; echo "run_runtime_checks=$runtime"; } >> "$GITHUB_OUTPUT"
+  lint:
+    name: lint
+    needs: [scope]
+    if: ${{ !cancelled() && (needs.scope.result != 'success' || needs.scope.outputs.draft == 'true' || needs.scope.outputs.run_code_checks == 'true') }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Stop when the scope did not finish
+        if: needs.scope.result != 'success'
+        run: exit 1
+      - name: Stop on a draft
+        if: needs.scope.outputs.draft == 'true'
+        run: |
+          echo "::error title=lint::Draft pull request: lint runs in full when it is marked ready for review."
+          exit 1
+      - run: sleep 20 && echo "toy lint passed"
+  unit-shard:
+    name: unit-shard (${{ matrix.n }}/2)
+    needs: [scope]
+    if: ${{ needs.scope.outputs.run_code_checks == 'true' }}
+    strategy:
+      matrix:
+        n: [1, 2]
+    runs-on: ubuntu-latest
+    steps:
+      - run: sleep 45 && echo "toy unit shard passed"
+  unit:
+    name: unit
+    needs: [scope, unit-shard]
+    if: ${{ !cancelled() && (needs.scope.result != 'success' || needs.scope.outputs.draft == 'true' || needs.scope.outputs.run_code_checks == 'true') }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Stop on a draft
+        if: needs.scope.outputs.draft == 'true'
+        run: |
+          echo "::error title=unit::Draft pull request: unit runs in full when it is marked ready for review."
+          exit 1
+      - name: Check unit test shards
+        env:
+          SCOPE_RESULT: ${{ needs.scope.result }}
+          SHARD_RESULT: ${{ needs.unit-shard.result }}
+        run: |
+          echo "scope=$SCOPE_RESULT shards=$SHARD_RESULT"
+          [ "$SCOPE_RESULT" = "success" ] && [ "$SHARD_RESULT" = "success" ]
+  runtime-shard:
+    needs: [scope]
+    if: ${{ !cancelled() && needs.scope.result == 'success' && needs.scope.outputs.run_runtime_checks == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - run: sleep 45 && echo "toy runtime shard passed"
+  runtime-tests:
+    name: runtime-tests
+    needs: [scope, runtime-shard]
+    if: ${{ !cancelled() && (needs.scope.result != 'success' || needs.scope.outputs.draft == 'true' || needs.scope.outputs.run_runtime_checks == 'true') }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Stop on a draft
+        if: needs.scope.outputs.draft == 'true'
+        run: |
+          echo "::error title=runtime-tests::Draft pull request: runtime-tests runs in full when it is marked ready for review."
+          exit 1
+      - name: Check the runtime test shards
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          bad=$(jq -r 'to_entries[] | select(.value.result != "success") | .key' <<< "$NEEDS")
+          [ -z "$bad" ] || { echo "$bad"; exit 1; }
